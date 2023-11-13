@@ -1,6 +1,8 @@
 """Python logging support for Discord."""
 import logging
+import queue
 import sys
+import threading
 from typing import Optional, List
 
 from discord_webhook import DiscordEmbed, DiscordWebhook
@@ -45,7 +47,7 @@ class DiscordHandler(logging.Handler):
                  rate_limit_retry: bool=True,
                  embed_line_wrap_threshold: int=60,
                  message_break_char: Optional[str]=None,
-                 discord_timeout: float=5.0):
+                 discord_timeout: float=10.0):
         """
 
         :param service_name: Shows at the bot username in Discord.
@@ -138,96 +140,78 @@ class DiscordHandler(logging.Handler):
         discord.content = f"Failed to deliver log message: {resp.status_code}: {resp.content}"
         discord.execute()
 
-    def emit(self, record: logging.LogRecord):
-        """Send a log entry to Discord."""
+    def send_webhook_async(self, discord, record):
+        try:
+            thread_id = getattr(record, 'thread_id', None)
+            thread_name = getattr(record, 'thread_name', None)
+            discord.thread_id = thread_id
+            discord.thread_name = thread_name
 
+            resp = discord.execute()
+            assert isinstance(resp, Response), f"Discord webhook replies: {resp}"
+            if resp.status_code != 200:
+                self.attempt_to_report_failure(resp, discord)
+        except Exception as e:
+            print(f"Error from Discord logger {e}", file=sys.stderr)
+            self.handleError(record)
+
+    def emit(self, record: logging.LogRecord):
         if self.reentry_barrier:
-            # Don't let Discord and request internals to cause logging
-            # and thus infinite recursion. This is because the underlying
-            # requests package itself uses logging.
             return
 
         self.reentry_barrier = True
 
         try:
+            inbound_msg = self.format(record)
+            colour = self.colours.get(record.levelno) or self.colours[None]
+            emoji = self.emojis.get(record.levelno, "")
+            if emoji:
+                emoji += " "
 
-            # About the Embed footer trick
-            # https://stackoverflow.com/a/65543555/315168
+            split_msgs = self.split_by_break_character(inbound_msg)
 
-            try:
-                # Run internal log message formatting that will expand %s, %d and such
-                inbound_msg = self.format(record)
+            for msg in split_msgs:
+                if not msg:
+                    continue
 
-                # Choose colour and emoji for this log record
-                colour = self.colours.get(record.levelno) or self.colours[None]
-                emoji = self.emojis.get(record.levelno, "")
-                if emoji:
-                    # Add some space before the next char
-                    emoji += " "
+                discord = DiscordWebhook(
+                    url=self.webhook_url,
+                    username=self.service_name,
+                    rate_limit_retry=self.rate_limit_retry,
+                    avatar_url=self.avatar_url,
+                    timeout=self.discord_timeout,
+                )
 
-                split_msgs = self.split_by_break_character(inbound_msg)
+                if self.should_format_as_code_block(record, msg):
+                    try:
+                        first, remainder = msg.split("\n", maxsplit=1)
+                    except ValueError:
+                        first = msg
+                        remainder = ""
 
-                for msg in split_msgs:
+                    max_line_length = max([len(l) for l in msg.split("\n")])
+                    clipped = self.clip_content(remainder)
 
-                    if not msg:
-                        # Don't attempt to deliver empty messages
-                        continue
-
-                    # Start preparing the webhook payload for this messgae
-                    discord = DiscordWebhook(
-                        url=self.webhook_url,
-                        username=self.service_name,
-                        rate_limit_retry=self.rate_limit_retry,
-                        avatar_url=self.avatar_url,
-                        timeout=self.discord_timeout,
-                    )
-
-                    # Should we use Markdown code blocks for ths message?
-                    if self.should_format_as_code_block(record, msg):
-
-                        try:
-                            first, remainder = msg.split("\n", maxsplit=1)
-                        except ValueError:
-                            first = msg
-                            remainder = ""
-
-                        # Find our longest line lenght
-                        max_line_length = max([len(l) for l in msg.split("\n")])
-
-                        # Truncate the message to its last 2000 chars / bottom lines
-                        clipped = self.clip_content(remainder)
-
-                        if max_line_length > self.embed_line_wrap_threshold:
-                            # We have long lines, need to use Markdown
-                            clipped_msg = self.clip_content(msg)
-                            discord.content = f"```{emoji}{clipped_msg}```"
-                        else:
-                            # We have a clipped content, but short lines
-                            embed = DiscordEmbed(title=f"{emoji}{first}", description=clipped, color=colour)
-                            discord.add_embed(embed)
-
+                    if max_line_length > self.embed_line_wrap_threshold:
+                        clipped_msg = self.clip_content(msg)
+                        discord.content = f"```python\n{emoji}{clipped_msg}```"
                     else:
-                        # This message should be straight forward
-                        if emoji:
-                            title = f"{emoji}{msg}"
-                        else:
-                            title = msg
-                        embed = DiscordEmbed(title=title, color=colour)
+                        embed = DiscordEmbed(title=f"{emoji}{first}", description=clipped, color=colour)
                         discord.add_embed(embed)
+                else:
+                    if emoji:
+                        title = f"{emoji}{msg}"
+                    else:
+                        title = msg
+                    embed = DiscordEmbed(title=title, color=colour)
+                    discord.add_embed(embed)
 
-                    # Can be one or list of responses,
-                    #  bad API design
-                    resp = discord.execute()
-                    assert isinstance(resp, Response), f"Discord webhook replies: {resp}"
-                    if resp.status_code != 200:
-                        self.attempt_to_report_failure(resp, discord)
+                webhook_thread = threading.Thread(target=self.send_webhook_async, args=(discord, record))
+                webhook_thread.start()
 
-            except Exception as e:
-                # We cannot use handleError here, because Discord request may cause
-                # infinite recursion when Discord connection fails and
-                # it tries to log.
-                # We fall back to writing the error to stderr
-                print(f"Error from Discord logger {e}", file=sys.stderr)
-                self.handleError(record)
+        except Exception as e:
+            print(f"Error from Discord logger {e}", file=sys.stderr)
+            self.handleError(record)
+
         finally:
             self.reentry_barrier = False
